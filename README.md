@@ -26,3 +26,42 @@ I created this tool because I wanted to print a physical photo album of my holid
    ```bash
    git clone https://github.com/francescodifilippo/PhotoCherryPick.git
    cd PhotoCherryPick
+    ```
+2. Create a virtual environment (recommended):
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows use: venv\Scripts\activate
+    ```
+3. Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+## Usage
+
+### Basic Mode (Recommended)
+Extracts the best frame per scene. Prefers smiles + open eyes, but will save a high-quality neutral frame if no smiles are found.
+```bash
+python pcp.py input_video.mp4 ./output_folder
+```
+
+### Strict Mode
+Extracts a frame **ONLY** if it detects open eyes AND a smile. Scenes without smiling faces are skipped entirely.
+```bash
+python pcp.py input_video.mp4 ./output_folder --strict
+```
+
+## How it Works
+
+1. **Scene Splitting**: Uses `PySceneDetect` to identify shot boundaries.
+2. **Sampling**: Samples frames within each scene based on a configurable step.
+3. **Scoring**: 
+    - Checks for blur using Laplacian variance.
+    - Detects facial landmarks via MediaPipe.
+    - Calculates EAR (Eye Aspect Ratio) and MAR (Mouth Aspect Ratio).
+4. **Selection**: Picks the highest-scoring frame per scene based on the active mode.
+5. **Export**: Saves the JPEG and uses `piexif` to inject the original video's creation date, device model, and exact frame timestamp into the EXIF `UserComment` field.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
