@@ -1,211 +1,482 @@
-"""
-PhotoCherryPick (PCP) v0.3
-==============================
-Extracts the best frames from videos, scene by scene.
-Logic:
-1. Detects scene changes.
-2. For each scene, searches for faces.
-3. Prefers smiles + open eyes.
-4. --strict flag: saves ONLY if smile + open eyes are detected.
-5. Default: saves the best available frame (even if neutral, as long as it's sharp).
-"""
+"""PhotoCherryPick (PCP) v0.3 - extract the best face frame from each scene."""
+
+import argparse
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
-import numpy as np
-import os
-import sys
-import math
 import piexif
-import argparse
-from datetime import datetime
-from scenedetect import detect, ContentDetector, SceneManager, VideoStreamCv2
+from pymediainfo import MediaInfo
+from scenedetect import ContentDetector, SceneManager, open_video
 
-try:
-    from pymediainfo import MediaInfo
-    HAS_MEDIAINFO = True
-except ImportError:
-    HAS_MEDIAINFO = False
+
+VERSION = "0.3"
+MODEL_FILENAME = "face_landmarker.task"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
 
 # --- CONFIGURATION ---
-EAR_THRESHOLD = 0.25       # Eyes open threshold
-MAR_THRESHOLD = 0.45       # Smile threshold
-BLUR_THRESHOLD = 100.0     # Sharpness threshold (Laplacian variance)
-FRAMES_PER_SCENE_CHECK = 15 # Frames to sample per scene (balances speed/precision)
+SMILE_THRESHOLD = 0.5
+EYE_OPEN_THRESHOLD = 0.5
+BLUR_THRESHOLD = 100.0
+FRAMES_PER_SCENE_CHECK = 15
+MAX_FACES = 10
 
-# MediaPipe Landmarks
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-MOUTH = [13, 14, 78, 308]
+# MediaInfo fields are ordered from the closest to the original capture date
+# to container bookkeeping dates.
+DATE_FIELDS = ("recorded_date", "mastered_date", "encoded_date", "tagged_date")
+MAKE_FIELDS = ("make", "comapplequicktime_make", "com_apple_quicktime_make")
+MODEL_FIELDS = ("model", "comapplequicktime_model", "com_apple_quicktime_model")
 
-def calculate_distance(p1, p2):
-    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+# MediaPipe Face Landmarker blendshapes used for expression scoring.
+REQUIRED_BLENDSHAPES = {
+    "eyeBlinkLeft",
+    "eyeBlinkRight",
+    "mouthSmileLeft",
+    "mouthSmileRight",
+}
 
-def calculate_ear(landmarks, eye_indices):
-    p1, p2, p3, p4, p5, p6 = [landmarks[i] for i in eye_indices]
-    v1, v2 = calculate_distance(p2, p6), calculate_distance(p3, p5)
-    h = calculate_distance(p1, p4)
-    return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
 
-def calculate_mar(landmarks):
-    p_top, p_bottom, p_left, p_right = [landmarks[i] for i in MOUTH]
-    v, h = calculate_distance(p_top, p_bottom), calculate_distance(p_left, p_right)
-    return v / h if h > 0 else 0.0
+def parse_mediainfo_datetime(value):
+    """Parse the ISO-like date strings returned by MediaInfo."""
+    if not value:
+        return None
 
-def is_blurry(frame, threshold=BLUR_THRESHOLD):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
+    value = str(value).strip()
+    if value.startswith("UTC "):
+        value = value[4:] + "+00:00"
+    elif value.endswith(" UTC"):
+        value = value[:-4] + "+00:00"
+    elif value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _first_track_value(track, field_names):
+    for field_name in field_names:
+        value = getattr(track, field_name, None)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if value:
+            return str(value)
+    return None
+
 
 def get_video_metadata(video_path):
-    metadata = {
-        "datetime": None, 
-        "make": "Unknown", 
-        "model": "Unknown", 
-        "comment": f"Source: {os.path.basename(video_path)}"
-    }
-    if HAS_MEDIAINFO:
-        try:
-            for track in MediaInfo.parse(video_path).tracks:
-                if track.track_type == "General" and hasattr(track, 'tagged_date') and track.tagged_date:
-                    # Format date for EXIF (YYYY:MM:DD HH:MM:SS)
-                    raw_date = track.tagged_date.replace("UTC ", "").replace(" ", "T")
-                    metadata["datetime"] = raw_date[:19].replace("T", " ").replace("-", ":")
-                elif track.track_type == "Video":
-                    if hasattr(track, 'writing_library') and track.writing_library: 
-                        metadata["model"] = track.writing_library
-                    if hasattr(track, 'make') and track.make: 
-                        metadata["make"] = track.make
-        except Exception: 
-            pass
-    return metadata
+    """Read capture metadata, falling back explicitly to the file mtime."""
+    video_path = Path(video_path)
+    captured_at = None
+    date_source = None
+    make = None
+    model = None
 
-def save_frame_with_exif(frame, output_path, frame_idx, timestamp_str, video_metadata):
-    cv2.imwrite(output_path, frame)
-    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-    
-    exif_dict["0th"][piexif.ImageIFD.DateTime] = video_metadata["datetime"] or datetime.now().strftime("%Y:%m:%d %H:%M:%S")
-    exif_dict["0th"][piexif.ImageIFD.Make] = video_metadata["make"]
-    exif_dict["0th"][piexif.ImageIFD.Model] = video_metadata["model"]
-    
-    # UserComment: Custom field for timestamp and frame info
-    custom_comment = f"PCP v0.3 | Frame: {frame_idx} | Time: {timestamp_str} | {video_metadata['comment']}"
-    exif_dict["Exif"][piexif.ExifIFD.UserComment] = b"UNICODE\x00\x00" + custom_comment.encode('utf-16be')
-    
     try:
-        piexif.insert(piexif.dump(exif_dict), output_path)
-    except Exception: 
-        pass
+        tracks = MediaInfo.parse(str(video_path)).tracks
+    except Exception as exc:
+        print(f"Warning: video metadata unavailable ({exc}); using file date.")
+        tracks = []
 
-def format_timestamp(seconds, fps):
-    h, m = int(seconds // 3600), int((seconds % 3600) // 60)
-    return f"{h:02d}:{m:02d}:{(seconds % 60):06.3f}"
+    for track in tracks:
+        if track.track_type not in {"General", "Video"}:
+            continue
 
-def process_video(video_path, output_dir, strict_mode):
-    if not os.path.exists(output_dir): 
-        os.makedirs(output_dir)
+        if captured_at is None:
+            for field_name in DATE_FIELDS:
+                parsed = parse_mediainfo_datetime(getattr(track, field_name, None))
+                if parsed is not None:
+                    captured_at = parsed
+                    date_source = f"embedded video metadata ({field_name})"
+                    break
 
+        make = make or _first_track_value(track, MAKE_FIELDS)
+        model = model or _first_track_value(track, MODEL_FIELDS)
+
+    if captured_at is None:
+        # A portable file creation time does not exist on every OS. The mtime is
+        # therefore the explicit, reproducible fallback stored in UserComment.
+        captured_at = datetime.fromtimestamp(video_path.stat().st_mtime).astimezone()
+        date_source = "video file modification time (embedded original date unavailable)"
+
+    return {
+        "datetime": captured_at,
+        "date_source": date_source,
+        "make": make,
+        "model": model,
+        "source": video_path.name,
+    }
+
+
+def format_timestamp(seconds):
+    total_ms = max(0, round(seconds * 1000))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
+def sample_frame_indices(start_frame, end_frame, sample_count):
+    """Return at most sample_count evenly-spaced frames, away from cut edges."""
+    if sample_count < 1:
+        raise ValueError("sample_count must be at least 1")
+
+    duration = end_frame - start_frame
+    if duration <= 0:
+        return []
+    if duration <= sample_count:
+        return list(range(start_frame, end_frame))
+
+    # Sample the centre of equal-width bins, avoiding transition frames at cuts.
+    return [
+        start_frame + ((2 * index + 1) * duration) // (2 * sample_count)
+        for index in range(sample_count)
+    ]
+
+
+def frame_sharpness(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def analyze_faces(face_blendshapes, smile_threshold, eye_open_threshold):
+    """Return worst-face metrics so every detected person must look good."""
+    face_metrics = []
+    for categories in face_blendshapes:
+        scores = {category.category_name: category.score for category in categories}
+        if not REQUIRED_BLENDSHAPES.issubset(scores):
+            continue
+
+        eye_open = 1.0 - max(scores["eyeBlinkLeft"], scores["eyeBlinkRight"])
+        smile = (scores["mouthSmileLeft"] + scores["mouthSmileRight"]) / 2.0
+        face_metrics.append((eye_open, smile))
+
+    if not face_metrics:
+        return None
+
+    min_eye_open = min(eye_open for eye_open, _ in face_metrics)
+    min_smile = min(smile for _, smile in face_metrics)
+
+    # The least successful face determines group-photo quality: one blinking
+    # person must not be hidden by another person's high score.
+    return {
+        "face_count": len(face_metrics),
+        "eye_open": min_eye_open,
+        "smile": min_smile,
+        "score": (min_eye_open + min_smile) / 2.0,
+        "perfect": min_eye_open >= eye_open_threshold and min_smile >= smile_threshold,
+    }
+
+
+def candidate_rank(candidate):
+    """Perfect frames win, then more detected faces, quality, and sharpness."""
+    return (
+        candidate["perfect"],
+        candidate["face_count"],
+        candidate["score"],
+        candidate["sharpness"],
+    )
+
+
+def _exif_offset(value):
+    offset = value.strftime("%z")
+    return f"{offset[:3]}:{offset[3:]}" if offset else None
+
+
+def save_frame_with_exif(frame, output_path, frame_idx, timestamp_sec, video_metadata):
+    """Create a JPEG without overwriting and remove it if EXIF writing fails."""
+    output_path = Path(output_path)
+    frame_datetime = video_metadata["datetime"] + timedelta(seconds=timestamp_sec)
+    exif_datetime = frame_datetime.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+    subsecond = f"{frame_datetime.microsecond:06d}".encode("ascii")
+    timestamp = format_timestamp(timestamp_sec)
+    comment = (
+        f"PCP v{VERSION} | Frame: {frame_idx} | Video time: {timestamp} | "
+        f"Date source: {video_metadata['date_source']} | Source: {video_metadata['source']}"
+    )
+
+    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_datetime
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_datetime
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_datetime
+    exif_dict["Exif"][piexif.ExifIFD.SubSecTime] = subsecond
+    exif_dict["Exif"][piexif.ExifIFD.SubSecTimeOriginal] = subsecond
+    exif_dict["Exif"][piexif.ExifIFD.SubSecTimeDigitized] = subsecond
+
+    # UserComment records both the position in the source video and whether the
+    # date came from embedded metadata or the file modification timestamp.
+    exif_dict["Exif"][piexif.ExifIFD.UserComment] = (
+        b"UNICODE\x00" + comment.encode("utf-16be")
+    )
+
+    offset = _exif_offset(frame_datetime)
+    if offset:
+        offset_bytes = offset.encode("ascii")
+        exif_dict["Exif"][piexif.ExifIFD.OffsetTime] = offset_bytes
+        exif_dict["Exif"][piexif.ExifIFD.OffsetTimeOriginal] = offset_bytes
+        exif_dict["Exif"][piexif.ExifIFD.OffsetTimeDigitized] = offset_bytes
+    if video_metadata["make"]:
+        exif_dict["0th"][piexif.ImageIFD.Make] = video_metadata["make"].encode("utf-8")
+    if video_metadata["model"]:
+        exif_dict["0th"][piexif.ImageIFD.Model] = video_metadata["model"].encode("utf-8")
+
+    encoded_ok, encoded_frame = cv2.imencode(
+        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
+    )
+    if not encoded_ok:
+        raise OSError(f"could not encode JPEG: {output_path}")
+
+    created = False
+    try:
+        # Exclusive creation prevents silent replacement of an earlier export.
+        with output_path.open("xb") as output_file:
+            created = True
+            output_file.write(encoded_frame.tobytes())
+        piexif.insert(piexif.dump(exif_dict), str(output_path))
+    except Exception:
+        if created:
+            output_path.unlink(missing_ok=True)
+        raise
+
+
+def process_video(
+    video_path,
+    output_dir,
+    model_path,
+    strict_mode=False,
+    smile_threshold=SMILE_THRESHOLD,
+    eye_open_threshold=EYE_OPEN_THRESHOLD,
+    blur_threshold=BLUR_THRESHOLD,
+    samples_per_scene=FRAMES_PER_SCENE_CHECK,
+):
+    video_path = Path(video_path)
+    output_dir = Path(output_dir)
+    model_path = Path(model_path)
+
+    if not video_path.is_file():
+        raise FileNotFoundError(f"input video not found: {video_path}")
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            f"Face Landmarker model not found: {model_path}\nDownload it from: {MODEL_URL}"
+        )
+    if output_dir.exists() and not output_dir.is_dir():
+        raise NotADirectoryError(f"output path is not a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. READ METADATA AND DETECT SCENES
     print("Reading metadata and detecting scenes...")
     video_metadata = get_video_metadata(video_path)
-    
-    # 1. SCENE DETECTION
-    video_stream = VideoStreamCv2(video_path)
-    scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(threshold=27.0))
-    
-    scene_manager.detect_scenes(video_stream)
-    scene_list = scene_manager.get_scene_list()
-    video_stream.release()
+    print(f"Photo date source: {video_metadata['date_source']}")
+
+    video_stream = open_video(str(video_path))
+    try:
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=27.0))
+        scene_manager.detect_scenes(video_stream)
+
+        # A video without cuts is still one valid scene.
+        scene_list = scene_manager.get_scene_list(start_in_scene=True)
+        scene_fps = video_stream.frame_rate
+    finally:
+        video_stream.capture.release()
 
     if not scene_list:
-        print("No scenes detected or video is too short.")
-        return
+        print("No readable video frames found.")
+        return 0, 0
 
     print(f"Found {len(scene_list)} scenes. Starting analysis...")
 
-    # 2. INITIALIZE MEDIAPIPE
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=2, refine_landmarks=True, min_detection_confidence=0.5)
+    # 2. INITIALIZE MEDIAPIPE FACE LANDMARKER
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+        num_faces=MAX_FACES,
+        output_face_blendshapes=True,
+    )
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise OSError(f"could not open input video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps != fps:
+        fps = scene_fps or 30.0
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     saved_count = 0
+    failed_count = 0
 
-    # 3. SCENE-BY-SCENE ANALYSIS
-    for i, (start_time, end_time) in enumerate(scene_list):
-        start_frame = start_time.get_frames()
-        end_frame = end_time.get_frames()
-        scene_duration = end_frame - start_frame
-        
-        best_frame_data = None # Will hold: {'frame_idx': x, 'frame': img, 'score': y, 'type': 'perfect'|'fallback'}
+    try:
+        with mp.tasks.vision.FaceLandmarker.create_from_options(options) as face_landmarker:
+            # 3. ANALYZE EACH SCENE
+            for scene_index, (start_time, end_time) in enumerate(scene_list, start=1):
+                start_frame = start_time.frame_num
+                end_frame = end_time.frame_num
+                best_frame = None
 
-        # Sample frames within the scene
-        step = max(1, scene_duration // FRAMES_PER_SCENE_CHECK)
-        for frame_idx in range(start_frame, end_frame, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret: 
-                continue
+                for frame_idx in sample_frame_indices(
+                    start_frame, end_frame, samples_per_scene
+                ):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    frame_ok, frame = cap.read()
+                    if not frame_ok:
+                        continue
 
-            if is_blurry(frame): 
-                continue
+                    # Reject blur before running the more expensive ML model.
+                    sharpness = frame_sharpness(frame)
+                    if sharpness < blur_threshold:
+                        continue
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb_frame)
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    result = face_landmarker.detect(
+                        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                    )
+                    metrics = analyze_faces(
+                        result.face_blendshapes,
+                        smile_threshold,
+                        eye_open_threshold,
+                    )
+                    if metrics is None:
+                        continue
 
-            if results.multi_face_landmarks:
-                # Use the first detected face as reference
-                landmarks = results.multi_face_landmarks[0].landmark
-                avg_ear = (calculate_ear(landmarks, LEFT_EYE) + calculate_ear(landmarks, RIGHT_EYE)) / 2.0
-                mar = calculate_mar(landmarks)
+                    # Prefer the decoder presentation timestamp for variable
+                    # frame-rate video, falling back to frame/fps when absent.
+                    timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if frame_idx and timestamp_ms <= 0:
+                        timestamp_sec = frame_idx / fps
+                    else:
+                        timestamp_sec = max(0.0, timestamp_ms / 1000.0)
 
-                is_perfect = (avg_ear > EAR_THRESHOLD) and (mar > MAR_THRESHOLD)
-                score = avg_ear + mar # Simple score: higher is better
-
-                frame_type = 'perfect' if is_perfect else 'fallback'
-                
-                # Selection Logic: 
-                # - If 'perfect', it overwrites anything.
-                # - If 'fallback', keep it only if we don't have a 'perfect' frame for this scene yet.
-                if is_perfect or (best_frame_data is None or best_frame_data['type'] == 'fallback'):
-                    best_frame_data = {
-                        'frame_idx': frame_idx,
-                        'frame': frame.copy(),
-                        'score': score,
-                        'type': frame_type,
-                        'ear': avg_ear,
-                        'mar': mar
+                    candidate = {
+                        **metrics,
+                        "frame_idx": frame_idx,
+                        "timestamp_sec": timestamp_sec,
+                        "sharpness": sharpness,
+                        "frame": frame.copy(),
                     }
+                    if best_frame is None or candidate_rank(candidate) > candidate_rank(
+                        best_frame
+                    ):
+                        best_frame = candidate
 
-        # 4. FINAL DECISION FOR THE SCENE
-        if best_frame_data:
-            if strict_mode and best_frame_data['type'] == 'fallback':
-                print(f"  Scene {i+1}: Skipped (strict mode, requires smile + open eyes)")
-                continue
+                # 4. MAKE THE FINAL DECISION FOR THIS SCENE
+                if best_frame is None:
+                    print(f"  Scene {scene_index}: Skipped (no sharp frame with a face)")
+                    continue
+                if strict_mode and not best_frame["perfect"]:
+                    print(
+                        f"  Scene {scene_index}: Skipped "
+                        "(strict mode requires every face smiling with open eyes)"
+                    )
+                    continue
 
-            timestamp_sec = best_frame_data['frame_idx'] / fps
-            timestamp_str = format_timestamp(timestamp_sec, fps)
-            quality_tag = "PERFECT" if best_frame_data['type'] == 'perfect' else "FALLBACK"
-            
-            filename = f"PCP_Scene{i+1:03d}_{quality_tag}_T{timestamp_str.replace(':', '-')}.jpg"
-            output_path = os.path.join(output_dir, filename)
-            
-            save_frame_with_exif(best_frame_data['frame'], output_path, best_frame_data['frame_idx'], timestamp_str, video_metadata)
-            print(f"  Scene {i+1}: Saved ({quality_tag}) | EAR: {best_frame_data['ear']:.2f} | MAR: {best_frame_data['mar']:.2f}")
-            saved_count += 1
+                timestamp = format_timestamp(best_frame["timestamp_sec"])
+                quality_tag = "PERFECT" if best_frame["perfect"] else "FALLBACK"
+                filename = (
+                    f"PCP_Scene{scene_index:03d}_{quality_tag}_"
+                    f"T{timestamp.replace(':', '-')}.jpg"
+                )
+                output_path = output_dir / filename
+                if output_path.exists():
+                    print(f"  Scene {scene_index}: Skipped (already exists: {filename})")
+                    continue
 
-    cap.release()
-    face_mesh.close()
-    print(f"\nDone! Saved {saved_count} photos to '{output_dir}'")
+                # 5. EXPORT JPEG AND EXIF
+                try:
+                    save_frame_with_exif(
+                        best_frame["frame"],
+                        output_path,
+                        best_frame["frame_idx"],
+                        best_frame["timestamp_sec"],
+                        video_metadata,
+                    )
+                except Exception as exc:
+                    failed_count += 1
+                    print(f"  Scene {scene_index}: Failed to save ({exc})")
+                    continue
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PhotoCherryPick (PCP) v3.0 - Extract the best frames from videos.")
+                print(
+                    f"  Scene {scene_index}: Saved ({quality_tag}) | "
+                    f"Faces: {best_frame['face_count']} | "
+                    f"Eyes: {best_frame['eye_open']:.2f} | "
+                    f"Smile: {best_frame['smile']:.2f}"
+                )
+                saved_count += 1
+    finally:
+        cap.release()
+
+    print(
+        f"\nDone! Saved {saved_count} photos to '{output_dir}'"
+        + (f"; {failed_count} failed" if failed_count else "")
+    )
+    return saved_count, failed_count
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=f"PhotoCherryPick (PCP) v{VERSION} - Extract the best face frames."
+    )
     parser.add_argument("video", help="Path to the input video file")
     parser.add_argument("output", help="Destination folder for extracted photos")
-    parser.add_argument("--strict", action="store_true", help="Save ONLY frames with smiles and open eyes (discard fallbacks)")
-    
-    args = parser.parse_args()
-    
-    if os.path.exists(args.video):
-        process_video(args.video, args.output, strict_mode=args.strict)
-    else:
-        print(f"Error: The video file '{args.video}' does not exist.")
+    parser.add_argument(
+        "--model",
+        default=str(Path(__file__).with_name(MODEL_FILENAME)),
+        help=f"Face Landmarker model path (default: {MODEL_FILENAME} next to pcp.py)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Save only frames where every detected face smiles with open eyes",
+    )
+    parser.add_argument(
+        "--smile-threshold", type=float, default=SMILE_THRESHOLD, metavar="0..1"
+    )
+    parser.add_argument(
+        "--eye-open-threshold", type=float, default=EYE_OPEN_THRESHOLD, metavar="0..1"
+    )
+    parser.add_argument(
+        "--blur-threshold", type=float, default=BLUR_THRESHOLD, metavar="N"
+    )
+    parser.add_argument(
+        "--samples-per-scene",
+        type=int,
+        default=FRAMES_PER_SCENE_CHECK,
+        metavar="N",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not 0.0 <= args.smile_threshold <= 1.0:
+        parser.error("--smile-threshold must be between 0 and 1")
+    if not 0.0 <= args.eye_open_threshold <= 1.0:
+        parser.error("--eye-open-threshold must be between 0 and 1")
+    if args.blur_threshold < 0:
+        parser.error("--blur-threshold cannot be negative")
+    if args.samples_per_scene < 1:
+        parser.error("--samples-per-scene must be at least 1")
+
+    try:
+        _, failed_count = process_video(
+            args.video,
+            args.output,
+            args.model,
+            strict_mode=args.strict,
+            smile_threshold=args.smile_threshold,
+            eye_open_threshold=args.eye_open_threshold,
+            blur_threshold=args.blur_threshold,
+            samples_per_scene=args.samples_per_scene,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 1 if failed_count else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

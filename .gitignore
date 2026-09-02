@@ -7,6 +7,8 @@ __pycache__/
 venv/
 env/
 ENV/
+/face_landmarker.task
+/testdata/
 
 # IDE
 .vscode/

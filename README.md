@@ -1,67 +1,130 @@
 # PhotoCherryPick (PCP)
 
-**PhotoCherryPick** is a lightweight, 100% local Python tool that automatically extracts the best frames from videos, scene by scene.
+**PhotoCherryPick 0.3** is a local Python tool that extracts the best frame
+containing faces from each scene of a video.
 
-## Why I built this
-
-I created this tool because I wanted to print a physical photo album of my holidays, but most of my best memories were captured in videos rather than photos. Manually scrubbing through hours of footage to find the perfect smiling faces was tedious, so I built PCP to automate the cherry-picking process. The goal was simple: get a set of high-quality stills, ready to be printed, without spending an evening pausing and rewinding the video player.
+It was built to turn holiday videos into a small set of printable photographs
+without manually scrubbing through every recording.
 
 ## Features
 
-- **Scene Detection**: Analyzes the video scene by scene to ensure variety (no duplicate frames from the same shot).
-- **Face Analysis**: Uses pre-trained ML models (Google MediaPipe) to detect faces, calculate Eye Aspect Ratio (EAR) for open eyes, and Mouth Aspect Ratio (MAR) for smiles.
-- **Blur Rejection**: Automatically discards out-of-focus or motion-blurred frames before heavy processing.
-- **EXIF Metadata Injection**: Reads video metadata (creation date, device model) and embeds it into the extracted photos, including the exact timestamp of the frame.
-- **Strict / Fallback Modes**: Choose whether to save *only* perfect smiling frames, or fallback to the best available neutral frame if no smiles are detected.
-- **100% Offline & Private**: No cloud APIs, no data leaving your machine, no model training required.
+- **Scene detection**: analyzes each shot independently; a video without cuts is
+  treated as one scene.
+- **Face expression analysis**: MediaPipe Face Landmarker evaluates smile and
+  eye-blink blendshapes for every detected face.
+- **Group-photo scoring**: the least successful face determines the frame
+  quality, so one smiling person cannot hide somebody blinking.
+- **Blur rejection**: skips frames below a configurable Laplacian sharpness
+  threshold before running the ML model.
+- **Faces only**: scenes without a detected face are intentionally skipped.
+- **Strict and fallback modes**: default mode accepts the best neutral face
+  frame; strict mode requires every detected face to smile with open eyes.
+- **EXIF metadata**: writes `DateTime`, `DateTimeOriginal`,
+  `DateTimeDigitized`, subsecond data, timezone offset, camera make/model when
+  available, source frame, and video timestamp.
+- **Explicit date fallback**: embedded capture metadata is preferred. If it is
+  absent, PCP uses the source video's file modification time and records that
+  choice in the EXIF `UserComment`.
+- **Safe export**: existing JPEG files are never overwritten.
+- **Local processing**: after dependencies and the model are downloaded, video
+  frames are processed locally without cloud APIs.
 
-## Prerequisites
+## Requirements
 
-- Python 3.8 or higher
-- [MediaInfo CLI](https://mediaarea.net/en/MediaInfo) (Optional but recommended for extracting video metadata. Usually auto-installed with `pymediainfo` on most systems).
+- Python 3.9 or newer
+- `curl`, a browser, or another downloader for the Face Landmarker model
+- MediaInfo's native library if the `pymediainfo` wheel for the platform does
+  not bundle it
 
 ## Installation
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/francescodifilippo/PhotoCherryPick.git
    cd PhotoCherryPick
-    ```
-2. Create a virtual environment (recommended):
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use: venv\Scripts\activate
-    ```
-3. Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
+   ```
+
+2. Create and activate a virtual environment:
+
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+   On Windows:
+
+   ```powershell
+   py -m venv venv
+   venv\Scripts\Activate.ps1
+   ```
+
+3. Install the dependencies:
+
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
+
+4. Download the official MediaPipe Face Landmarker model next to `pcp.py`:
+
+   ```bash
+   curl -L --fail --output face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+   ```
+
+   The model is intentionally not committed to this repository.
 
 ## Usage
 
-### Basic Mode (Recommended)
-Extracts the best frame per scene. Prefers smiles + open eyes, but will save a high-quality neutral frame if no smiles are found.
+Default mode saves the best sharp face frame in every scene. It prefers frames
+where all detected faces smile with open eyes, then falls back to the best
+neutral frame:
+
 ```bash
-python pcp.py input_video.mp4 ./output_folder
+python pcp.py input_video.mp4 output
 ```
 
-### Strict Mode
-Extracts a frame **ONLY** if it detects open eyes AND a smile. Scenes without smiling faces are skipped entirely.
+Strict mode skips every scene that lacks a frame where all detected faces smile
+with open eyes:
+
 ```bash
-python pcp.py input_video.mp4 ./output_folder --strict
+python pcp.py input_video.mp4 output --strict
 ```
 
-## How it Works
+Useful calibration options:
 
-1. **Scene Splitting**: Uses `PySceneDetect` to identify shot boundaries.
-2. **Sampling**: Samples frames within each scene based on a configurable step.
-3. **Scoring**: 
-    - Checks for blur using Laplacian variance.
-    - Detects facial landmarks via MediaPipe.
-    - Calculates EAR (Eye Aspect Ratio) and MAR (Mouth Aspect Ratio).
-4. **Selection**: Picks the highest-scoring frame per scene based on the active mode.
-5. **Export**: Saves the JPEG and uses `piexif` to inject the original video's creation date, device model, and exact frame timestamp into the EXIF `UserComment` field.
+```text
+--smile-threshold 0..1
+--eye-open-threshold 0..1
+--blur-threshold N
+--samples-per-scene N
+--model PATH
+```
+
+Run `python pcp.py --help` for the complete command reference.
+
+## Selection flow
+
+1. Detect scene boundaries with PySceneDetect.
+2. Sample at most 15 evenly spaced frames per scene by default.
+3. Reject blurred frames.
+4. Detect up to 10 faces and score smiles and open eyes.
+5. Prefer a perfect frame, then the frame with more detected faces, the best
+   worst-face score, and finally the greatest sharpness.
+6. Save the JPEG with EXIF metadata. The video timestamp is taken from the
+   decoder presentation timestamp when available, which also supports
+   variable-frame-rate video.
+
+Scenes without faces are reported as skipped and never exported.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The test suite covers date parsing and fallback, group scoring, frame sampling,
+timestamp rounding, best-frame ranking, EXIF output, and overwrite protection.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License; see [LICENSE](LICENSE).
